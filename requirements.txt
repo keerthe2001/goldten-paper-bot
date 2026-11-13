@@ -1,0 +1,11 @@
+smartapi-python==1.5.5
+websocket-client>=1.6
+logzero>=1.7          # used inside smartapi-python
+pyotp>=2.9
+requests>=2.31
+python-dotenv>=1.0
+fastapi>=0.110
+uvicorn>=0.29
+gspread>=6.0
+tzdata                # timezone data (needed on Windows)
+pytest>=8.0

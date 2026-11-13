@@ -1,0 +1,18 @@
+# systemd unit for the bot worker.  Copy to /etc/systemd/system/ on the server.
+# Replace "ubuntu" with your Linux user if different.
+[Unit]
+Description=Gold Ten paper-trading bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=ubuntu
+WorkingDirectory=/home/ubuntu/goldten-paper-bot
+ExecStart=/home/ubuntu/goldten-paper-bot/.venv/bin/python -m bot.main
+Restart=always
+RestartSec=10
+Environment=PYTHONUNBUFFERED=1
+Environment=TZ=Asia/Kolkata
+
+[Install]
+WantedBy=multi-user.target

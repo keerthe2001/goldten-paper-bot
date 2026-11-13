@@ -1,0 +1,15 @@
+# systemd unit for the read-only dashboard API.  Copy to /etc/systemd/system/.
+[Unit]
+Description=Gold Ten dashboard API
+After=network.target
+
+[Service]
+User=ubuntu
+WorkingDirectory=/home/ubuntu/goldten-paper-bot
+# 127.0.0.1 = reachable only from inside the server; Nginx is the public front door
+ExecStart=/home/ubuntu/goldten-paper-bot/.venv/bin/uvicorn api.main:app --host 127.0.0.1 --port 8000
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
