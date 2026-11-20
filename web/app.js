@@ -120,7 +120,17 @@ function startLogs() {
   es.onerror = () => { /* the browser reconnects automatically */ };
 }
 
-refreshStatus(); refreshTrades(); refreshCurve(); startLogs();
+async function loadSheet() {
+  try {
+    const c = await getJSON("api/config");
+    if (!c.sheet_url) return;
+    $("sheet").src = c.sheet_url;
+    $("sheetLink").href = c.sheet_url.replace("?rm=minimal", "");
+    $("sheetCard").hidden = false;
+  } catch (e) { /* no sheet configured */ }
+}
+
+refreshStatus(); refreshTrades(); refreshCurve(); startLogs(); loadSheet();
 setInterval(refreshStatus, 3000);
 setInterval(refreshTrades, 10000);
 setInterval(refreshCurve, 60000);

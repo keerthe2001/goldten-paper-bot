@@ -52,6 +52,15 @@ def status():
     }
 
 
+@app.get("/api/config")
+def config():
+    """What the dashboard needs to embed the tracking sheet (behind the Nginx login)."""
+    sid = os.getenv("GOOGLE_SHEET_ID") or ""
+    gid = os.getenv("GOOGLE_SHEET_GID") or ""
+    return {"sheet_url": f"https://docs.google.com/spreadsheets/d/{sid}/edit?rm=minimal" + (f"#gid={gid}" if gid else "")
+            if sid else None}
+
+
 @app.get("/api/events")
 def events(limit: int = Query(200, le=2000), trades_only: bool = False):
     s = store()
