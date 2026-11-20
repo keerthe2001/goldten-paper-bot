@@ -156,6 +156,15 @@ class AngelFeed:
                 return float(h), float(l), float(o)
         return None
 
+    def minute_candles(self, token, start: dt.datetime, end: dt.datetime):
+        """1-minute candles [(time, o, h, l, c)] between start and end, used to replay a missed morning."""
+        out = []
+        for ts, o, h, l, c, *_ in self._candles(token, "ONE_MINUTE", start, end):
+            t = dt.datetime.fromisoformat(ts).replace(tzinfo=None)
+            if start <= t < end:
+                out.append((t, float(o), float(h), float(l), float(c)))
+        return out
+
     # ---- live prices ----
     def ltp(self, trading_symbol, token) -> float:
         def _do():
@@ -265,6 +274,9 @@ class SimFeed:
     def first15(self, token, day):
         return None   # SimFeed builds the 09:15 candle from its own ticks
 
+    def minute_candles(self, token, start, end):
+        return []     # the fake market has no history to replay
+
     def ltp(self, trading_symbol, token):
         i = int(token[3:])
         return round(self.price * (1 + 0.006 * i), 0)
@@ -289,3 +301,14 @@ class SimFeed:
 
     def stop_stream(self):
         self._cb = None
+
+
+def candles_to_ticks(candles):
+    """Turn 1-minute candles into the 4 prices a live feed would have shown: open, the two extremes,
+    close. For an up candle the low is assumed to come first, for a down candle the high."""
+    ticks = []
+    for t, o, h, l, c in candles:
+        mid = (l, h) if c >= o else (h, l)
+        for sec, px in ((0, o), (15, mid[0]), (30, mid[1]), (59, c)):
+            ticks.append((t + dt.timedelta(seconds=sec), px))
+    return ticks

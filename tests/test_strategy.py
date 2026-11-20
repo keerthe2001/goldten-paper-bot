@@ -56,25 +56,31 @@ def test_long_entry_target_then_stop2():
     e.prepare_day(DAY, EXP, {NOV: HIST})
     ev = ticks(e, NOV, [((9, 0), 129000), ((10, 0), 130200)])       # crosses 130156
     assert kinds(ev) == ["ENTRY"] and e.pos.side == 1 and e.pos.lots == 2
-    assert e.pos.target == pytest.approx(130200 * 1.015)
-    assert e.pos.sl == pytest.approx(max(130200 * 0.985, 127000 * 0.9988))   # SL1
-    assert e.wallet.blocked == pytest.approx(2 * 130200 * 0.10 * 1.25)   # 10% margin + 25% buffer
+    E = 130000 * 1.0012                                           # fills at the trigger, not the tick
+    assert e.pos.entry == pytest.approx(E)
+    assert e.pos.target == pytest.approx(E * 1.015)
+    assert e.pos.sl == pytest.approx(max(E * 0.985, 127000 * 0.9988))   # SL1
+    assert e.wallet.blocked == pytest.approx(2 * E * 0.10 * 1.25)      # 10% margin + 25% buffer
     ev = ticks(e, NOV, [((12, 0), 132200)])                          # target 132153
     assert kinds(ev) == ["TARGET"] and e.pos.lots == 1
-    assert e.pos.sl == pytest.approx(max(130200 * 0.985, 126000 * 0.9988))   # SL2 uses 4DLL
+    assert e.pos.sl == pytest.approx(max(E * 0.985, 126000 * 0.9988))   # SL2 uses 4DLL
     ev = ticks(e, NOV, [((15, 0), 128200)])
     assert kinds(ev) == ["STOP"] and e.pos is None
     assert e.wallet.blocked == 0
-    assert e.wallet.realized == pytest.approx((132200 - 130200) + (128200 - 130200))
+    sl2 = max(E * 0.985, 126000 * 0.9988)
+    assert e.wallet.realized == pytest.approx((E * 1.015 - E) + (sl2 - E))   # target and stop at their levels
 
 
 def test_short_entry_stop_both_lots():
     e = engine()
     e.prepare_day(DAY, EXP, {NOV: HIST})
-    ev = ticks(e, NOV, [((9, 0), 127000), ((11, 0), 125800), ((13, 0), 127700)])
+    ev = ticks(e, NOV, [((9, 0), 127000), ((11, 0), 125800), ((13, 0), 127800)])
     assert kinds(ev) == ["ENTRY", "STOP"]
+    E = 126000 * 0.9988                                   # sell trigger 125,848.8
+    SL = min(E * 1.015, 129000 * 1.0012)                  # SL1 = 127,736.5
     stop = [x for x in ev if x.kind == "STOP"][0]
-    assert stop.lots == 2 and stop.pnl == pytest.approx((125800 - 127700) * 2)
+    assert stop.price == pytest.approx(SL)                # filled at the stop level, not the 127,800 tick
+    assert stop.lots == 2 and stop.pnl == pytest.approx((E - SL) * 2, abs=0.01)
 
 
 def test_gap_up_waits_for_first_15_minutes():
@@ -87,7 +93,9 @@ def test_gap_up_waits_for_first_15_minutes():
     assert e.gap_entry[1] == pytest.approx(130900 * 1.00125)
     ev = ticks(e, NOV, [((9, 40), 131100)])
     assert kinds(ev) == ["ENTRY"] and e.pos.gap_trade
-    assert e.pos.target == pytest.approx(131100 * 1.0125)          # gap rule: 1.25% target
+    G = 130900 * 1.00125
+    assert e.pos.entry == pytest.approx(G)                         # fills at the gap trigger
+    assert e.pos.target == pytest.approx(G * 1.0125)               # gap rule: 1.25% target
 
 
 def test_gap_beyond_stop_uses_0915_candle():
@@ -147,3 +155,29 @@ def test_margin_is_dynamic_and_follows_price():
     assert w.blocked == pytest.approx(16250)                    # releases what was blocked per lot
     w.release(1)
     assert w.blocked == 0
+
+
+def test_todays_case_gap_down_late_start_no_trade_above_0915_low():
+    """20 Nov 2026: sell level 128,845, open 127,800 (gap down), 09:15 low 122,738.
+    Excel rule: sell only below 122,738 x 0.99875 = 122,585. At 124,402 there must be NO trade."""
+    hist = bars([(138181, 131000), (137000, 130500), (135269, 129000), (134000, 129500)])
+    e = engine()
+    e.prepare_day(DAY, EXP, {NOV: hist})
+    ev = ticks(e, NOV, [((9, 0), 127800), ((9, 7), 122738), ((9, 14), 124000), ((9, 34), 124402)])
+    assert "ENTRY" not in kinds(ev)
+    assert e.gap_entry[-1] == pytest.approx(122738 * 0.99875)
+    ev = ticks(e, NOV, [((10, 5), 122500)])
+    assert kinds(ev) == ["ENTRY"] and e.pos.entry == pytest.approx(122738 * 0.99875)
+
+
+def test_restart_same_day_restores_state_without_duplicate_trade():
+    e = engine()
+    e.prepare_day(DAY, EXP, {NOV: HIST})
+    ticks(e, NOV, [((9, 0), 129000), ((10, 0), 130200)])          # bought once
+    saved = e.save_state()
+    e2 = engine()
+    e2.load_state(saved)
+    e2.prepare_day(DAY, EXP, {NOV: HIST})
+    assert e2.restore_intraday(saved["intraday"]) == "2026-11-13T10:00:00"
+    assert e2.entries_today[1] == 1 and e2.day_open[NOV] == 129000
+    assert e2.pos and e2.pos.side == 1

@@ -210,6 +210,8 @@ class Engine:
         self.roll_pending = False
         self.entries_today = {1: 0, -1: 0}
         self.last_price: dict[str, float] = {}
+        self.last_tick: str | None = None
+        self._prev: float | None = None
 
     # ------------------------------------------------------------------ morning
     def prepare_day(self, day: dt.date, expiries: dict, bars: dict) -> list[Event]:
@@ -220,6 +222,7 @@ class Engine:
         self.day_open, self.first15 = {}, {}
         self.gap_entry, self.gap_stop = {1: None, -1: None}, None
         self.entries_today = {1: 0, -1: 0}
+        self.last_tick = None
         self.active = pick_contract(day, expiries, self.roll_days, self.holidays)
         self.levels = {c: lv for c in bars if (lv := compute_levels(c, bars[c]))}
         if not self.active or self.active not in self.levels:
@@ -265,8 +268,10 @@ class Engine:
         ev: list[Event] = []
         if self.day is None or ts.date() != self.day or ts.time() < self.session_open:
             return ev
+        self._prev = self.last_price.get(contract)     # price before this tick (None on the first)
         self.last_price[contract] = price
-        iso = ts.isoformat(timespec="seconds")
+        self.last_tick = ts.isoformat(timespec="seconds")
+        iso = self.last_tick
         in_first15 = ts.time() < dt.time(9, 15)
 
         # day open + first 15-minute candle tracking
@@ -334,16 +339,27 @@ class Engine:
                             note=f"Gap stop set from 09:15 candle: {self.pos.sl:.0f}"))
         return ev
 
+    def _fill(self, level, price, crossed_up: bool):
+        """A resting stop/limit order fills at its level when price moves through it between ticks;
+        it fills at the market price only if price was already beyond the level (a jump/gap)."""
+        prev = self._prev
+        if prev is None:
+            return price
+        was_beyond = prev >= level if crossed_up else prev <= level
+        return price if was_beyond else level
+
     def _manage(self, iso, price, in_first15):
         ev, p = [], self.pos
         if p.sl is not None and not (self.gap_stop == "wait"):
             hit = price <= p.sl if p.side == 1 else price >= p.sl
             if hit:
-                ev.append(self._close(iso, price, p.lots, "STOP", f"Stop-loss {p.sl:.0f} hit"))
+                fill = self._fill(p.sl, price, crossed_up=(p.side == -1))
+                ev.append(self._close(iso, fill, p.lots, "STOP", f"Stop-loss {p.sl:.0f} hit"))
                 self.pos = None
                 return ev
         if p.lots == 2 and ((p.side == 1 and price >= p.target) or (p.side == -1 and price <= p.target)):
-            ev.append(self._close(iso, price, 1, "TARGET", f"Target {p.target:.0f} hit: 1 lot booked"))
+            fill = self._fill(p.target, price, crossed_up=(p.side == 1))
+            ev.append(self._close(iso, fill, 1, "TARGET", f"Target {p.target:.0f} hit: 1 lot booked"))
             p.lots = 1
             lv = self.levels.get(p.contract)
             if lv:
@@ -362,7 +378,7 @@ class Engine:
             gap = g is not None
             trig = g if gap else (lv.buy_entry if side == 1 else lv.sell_entry)
             if (side == 1 and price >= trig) or (side == -1 and price <= trig):
-                return self._open(iso, side, price, lv, gap)
+                return self._open(iso, side, self._fill(trig, price, crossed_up=(side == 1)), lv, gap)
         return []
 
     def _open(self, iso, side, price, lv, gap):
@@ -436,7 +452,27 @@ class Engine:
     def save_state(self) -> dict:
         return dict(pos=asdict(self.pos) if self.pos else None, wallet=self.wallet.to_dict(),
                     day=self.day.isoformat() if self.day else None, entries_today=self.entries_today,
-                    roll_pending=self.roll_pending)
+                    roll_pending=self.roll_pending,
+                    intraday=dict(day=self.day.isoformat() if self.day else None, last_tick=self.last_tick,
+                                  day_open=self.day_open, first15=self.first15,
+                                  gap_entry={str(k): v for k, v in self.gap_entry.items()},
+                                  gap_stop=self.gap_stop,
+                                  entries_today={str(k): v for k, v in self.entries_today.items()},
+                                  last_price=self.last_price))
+
+    def restore_intraday(self, d: dict | None) -> str | None:
+        """After prepare_day(): if the saved state is from today, put back today's open, 09:15 candle,
+        gap flags and entry counts. Returns the last processed tick time (replay resumes after it)."""
+        if not d or not self.day or d.get("day") != self.day.isoformat():
+            return None
+        self.day_open = d.get("day_open", {})
+        self.first15 = d.get("first15", {})
+        self.gap_entry = {int(k): v for k, v in d.get("gap_entry", {}).items()} or {1: None, -1: None}
+        self.gap_stop = d.get("gap_stop")
+        self.entries_today = {int(k): v for k, v in d.get("entries_today", {}).items()} or {1: 0, -1: 0}
+        self.last_price.update(d.get("last_price", {}))
+        self.last_tick = d.get("last_tick")
+        return self.last_tick
 
     def load_state(self, d: dict):
         if not d:

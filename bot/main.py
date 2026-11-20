@@ -100,6 +100,7 @@ class Bot:
     def prepare(self, day: dt.date, now: dt.datetime):
         self.session_state = "preparing"
         self.beat(force=True)
+        saved_intraday = (self.store.get("engine_state") or {}).get("intraday")   # read before anything saves
         self.feed.login()
         contracts = self.feed.contracts()
         self.token_to_symbol = {c["token"]: s for s, c in contracts.items()}
@@ -111,15 +112,13 @@ class Bot:
         bars = {s: self.feed.daily_bars(contracts[s]["token"], day) for s in needed}
         self.handle(self.engine.prepare_day(day, expiries, bars))
 
-        # Restarted mid-session? Seed today's open and 09:15 candle so we don't invent a false gap.
-        if now.time() > dt.time(9, 0) and self.mode == "live":
-            for s in needed:
-                c = self.feed.first15(contracts[s]["token"], day)
-                if c:
-                    hi, lo, op = c
-                    self.engine.day_open[s] = op
-                    self.engine.first15[s] = [hi, lo]
-                    log.info("Seeded %s open %.0f, 09:15 candle H %.0f L %.0f", s, op, hi, lo)
+        # Started late or restarted mid-session? Pick up where we left off, then replay what we missed
+        # (1-minute candles) through the same rules, so gaps, entries and stops match a bot that ran all day.
+        resume = self.engine.restore_intraday(saved_intraday)
+        if now.time() > dt.time(9, 0):
+            start = dt.datetime.fromisoformat(resume) + dt.timedelta(seconds=1) if resume \
+                else dt.datetime.combine(day, dt.time(9, 0))
+            self.replay(start, now, {s: contracts[s]["token"] for s in needed})
         tokens = [contracts[s]["token"] for s in needed]
         self.feed.stop_stream()
         self.feed.start_stream(tokens, lambda tok, px: self.ticks.put((tok, px)))
@@ -127,6 +126,25 @@ class Bot:
         self.session_state = "open"
         self.store.set("contracts", {s: {"token": c["token"], "expiry": c["expiry"].isoformat()}
                                      for s, c in contracts.items()})
+
+    def replay(self, start: dt.datetime, end: dt.datetime, tokens: dict):
+        from .feed import candles_to_ticks
+        merged = []
+        for sym, tok in tokens.items():
+            try:
+                merged += [(t, sym, px) for t, px in candles_to_ticks(self.feed.minute_candles(tok, start, end))]
+            except Exception as exc:
+                log.warning("Replay: no 1-minute candles for %s (%s)", sym, exc)
+        merged.sort(key=lambda x: x[0])
+        if not merged:
+            return
+        log.info("Replaying %d prices from %s to %s", len(merged), start.strftime("%H:%M"), end.strftime("%H:%M"))
+        for t, sym, px in merged:
+            evs = self.engine.on_tick(t, sym, px)
+            for e in evs:
+                e.note += " [replayed]"
+            self.handle(evs)
+        self.store.set("engine_state", self.engine.save_state())
 
     # ------------------------------------------------------------------ status
     def beat(self, force=False):
@@ -142,6 +160,8 @@ class Bot:
         })
         snap = self.engine.snapshot()
         self.store.set("snapshot", snap)
+        if self.session_state == "open":   # remember how far today has been processed (restart resumes here)
+            self.store.set("engine_state", self.engine.save_state())
         if time.time() - self.last_equity >= 60 and self.session_state == "open":
             self.last_equity = time.time()
             w = snap["wallet"]
