@@ -17,6 +17,7 @@ async function refreshStatus() {
     const s = await getJSON("api/status");
     const pill = $("alive"), hb = s.heartbeat || {};
     if (!s.alive) { pill.textContent = "Bot stopped"; pill.className = "pill bad"; }
+    else if (hb.session === "login_failed") { pill.textContent = "Login failed: check .env"; pill.className = "pill bad"; }
     else if (hb.session === "open") { pill.textContent = "Monitoring"; pill.className = "pill ok"; }
     else { pill.textContent = hb.session === "holiday" ? "Market holiday" : "Market closed"; pill.className = "pill idle"; }
     $("beat").textContent = s.heartbeat_age_s == null ? (s.reason || "") :

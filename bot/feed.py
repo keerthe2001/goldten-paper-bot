@@ -11,7 +11,9 @@ from __future__ import annotations
 import datetime as dt
 import logging
 import math
+import os
 import random
+import socket
 import threading
 import time
 from typing import Callable
@@ -25,11 +27,17 @@ IST = dt.timezone(dt.timedelta(hours=5, minutes=30))
 SCRIP_MASTER = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
 
 
+class AuthError(RuntimeError):
+    """Credentials were rejected: never retry (repeated wrong PINs can lock the Angel account)."""
+
+
 def _retry(fn, what, tries=5, base=2.0):
     """Call fn(); on failure wait 2, 4, 8, 16 s ... (exponential backoff)."""
     for i in range(tries):
         try:
             return fn()
+        except AuthError:
+            raise
         except Exception as exc:
             wait = base * 2 ** i
             log.warning("%s failed (%s); retry %d/%d in %.0fs", what, exc, i + 1, tries, wait)
@@ -55,15 +63,44 @@ class AngelFeed:
         time.sleep(seconds)
 
     # ---- login ----
+    @staticmethod
+    def _quiet_smartapi():
+        """smartapi-python logs whole requests (API key, PIN, TOTP) to the console and to
+        logs/<date>/app.log. Silence it so secrets never reach our logs or journald."""
+        import logzero
+        logzero.loglevel(logging.CRITICAL + 1)
+        logzero.logfile(None)
+
+    @staticmethod
+    def _public_ip() -> str:
+        """The server's real public IP (must match the Static IP registered on the SmartAPI app)."""
+        ip = os.getenv("SERVER_PUBLIC_IP")
+        if ip:
+            return ip.strip()
+        return requests.get("https://api.ipify.org", timeout=10).text.strip()
+
     def login(self):
         import pyotp
         from SmartApi import SmartConnect
 
+        public_ip = self._public_ip()
+        try:
+            local_ip = socket.gethostbyname(socket.gethostname())
+        except OSError:
+            local_ip = "127.0.0.1"
+
         def _do():
             api = SmartConnect(api_key=self.api_key)
+            self._quiet_smartapi()
+            # The library always sends a hard-coded placeholder IP (106.193.147.98) because of a
+            # bug in its IP detection; send the real one instead.
+            api.clientPublicIp = api.clientPublicIP = public_ip
+            api.clientLocalIp = api.clientLocalIP = local_ip
             res = api.generateSession(self.client_code, self.pin, pyotp.TOTP(self.totp_secret).now())
             if not res or not res.get("status"):
-                raise RuntimeError(f"login rejected: {res.get('message') if res else res}")
+                msg = (res or {}).get("message", "empty response")
+                code = (res or {}).get("errorcode", "")
+                raise AuthError(f"login rejected: {msg} {code}".strip())
             self.api = api
             self.jwt = res["data"]["jwtToken"].replace("Bearer ", "")
             self.feed_token = api.getfeedToken()

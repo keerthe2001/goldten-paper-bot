@@ -18,7 +18,7 @@ from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 
-from .feed import AngelFeed, SimFeed
+from .feed import AngelFeed, AuthError, SimFeed
 from .notify import Sheets, Telegram
 from .store import Store
 from .strategy import Engine, Wallet
@@ -157,6 +157,14 @@ class Bot:
                 self.loop_once()
             except KeyboardInterrupt:
                 raise
+            except AuthError as exc:
+                # Wrong PIN / TOTP / API key: do NOT keep retrying (Angel can lock the account).
+                log.error("%s. Fix .env, then: sudo systemctl restart goldten-bot", exc)
+                self.tg.send(f"⛔ Gold Ten bot login rejected: {exc}. Fix .env and restart the bot.")
+                self.session_state = "login_failed"
+                while True:                   # stay up so the dashboard shows the problem
+                    self.beat(force=True)
+                    time.sleep(10)
             except Exception as exc:
                 log.exception("Loop error: %s", exc)
                 self.tg.send(f"⚠️ Gold Ten bot error: {exc}")
