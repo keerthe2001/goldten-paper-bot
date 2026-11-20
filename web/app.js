@@ -31,8 +31,18 @@ async function refreshStatus() {
     $("feed").textContent = hb.market_time ? `${hb.feed} feed · market time ${hb.market_time.replace("T", " ")}` : "—";
 
     if (lv) {
-      $("buy").textContent = px(lv.buy_entry); $("buyT").textContent = px(lv.buy_target);
-      $("sell").textContent = px(lv.sell_entry); $("sellT").textContent = px(lv.sell_target);
+      // show the trigger that is actually live today: the gap level replaces the normal one
+      const g = snap.gap_entry || {};
+      const show = (side, normal, target, pct, boxE, boxT) => {
+        const v = g[side];
+        if (v === "wait") { $(boxE).textContent = "Waiting for 15-min candle"; $(boxT).textContent = "—"; }
+        else if (typeof v === "number") {
+          $(boxE).textContent = `${px(v)} (gap rule)`;
+          $(boxT).textContent = px(side === "1" ? v * (1 + pct) : v * (1 - pct));
+        } else { $(boxE).textContent = px(normal); $(boxT).textContent = px(target); }
+      };
+      show("1", lv.buy_entry, lv.buy_target, 0.0125, "buy", "buyT");
+      show("-1", lv.sell_entry, lv.sell_target, 0.0125, "sell", "sellT");
       $("d4").textContent = `${px(lv.hh4)} / ${px(lv.ll4)}`; $("d2").textContent = `${px(lv.hh2)} / ${px(lv.ll2)}`;
     }
     const flags = [];
