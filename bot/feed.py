@@ -47,7 +47,10 @@ def _retry(fn, what, tries=5, base=2.0):
 
 class AngelFeed:
     def __init__(self, api_key, client_code, pin, totp_secret, symbol="GOLDTEN"):
-        self.api_key, self.client_code, self.pin, self.totp_secret = api_key, client_code, pin, totp_secret
+        clean = lambda v: (v or "").strip()
+        self.api_key, self.pin = clean(api_key), clean(pin)
+        self.client_code = clean(client_code).upper()                  # Angel client IDs are upper case
+        self.totp_secret = clean(totp_secret).replace(" ", "").upper()  # base32: no spaces, upper case
         self.symbol = symbol
         self.api = None
         self.jwt = self.feed_token = None
