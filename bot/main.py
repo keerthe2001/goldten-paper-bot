@@ -56,7 +56,8 @@ class Bot:
     def __init__(self, sim: bool, speed: float):
         self.store = Store(ROOT / env("DB_PATH", "data/goldten.db"))
         self.tg = Telegram(env("TELEGRAM_TOKEN"), env("TELEGRAM_CHAT_ID"))
-        self.sheets = Sheets(env("GOOGLE_CREDS_FILE"), env("GOOGLE_SHEET_ID"), env("GOOGLE_SHEET_TAB", "Gold Ten Trades"))
+        self.sheets = Sheets(env("GOOGLE_CREDS_FILE"), env("GOOGLE_SHEET_ID"), env("GOOGLE_SHEET_TAB", "Gold Ten Fut"),
+                             rows=self.store.get("sheet_rows", {}))
         self.holidays = frozenset(dt.date.fromisoformat(d.strip())
                                   for d in (env("MCX_HOLIDAYS", "") or "").split(",") if d.strip())
         if sim:
@@ -111,8 +112,10 @@ class Bot:
         needed.discard(None)
         bars = {s: self.feed.daily_bars(contracts[s]["token"], day) for s in needed}
         self.handle(self.engine.prepare_day(day, expiries, bars))
-        if self.engine.pos:     # daily stop-loss trail -> tracking sheet
-            self.sheets.update_sl(self.engine.pos.opened, round(self.engine.pos.sl or 0, 2))
+        if self.engine.pos:     # daily stop-loss trail -> tracking sheet (H / K columns)
+            p = self.engine.pos
+            lv = self.engine.levels.get(p.contract)
+            self.sheets.update_levels(p.opened, p.side, lv and dict(hh2=lv.hh2, ll2=lv.ll2, hh4=lv.hh4, ll4=lv.ll4))
 
         # Started late or restarted mid-session? Pick up where we left off, then replay what we missed
         # (1-minute candles) through the same rules, so gaps, entries and stops match a bot that ran all day.
@@ -162,6 +165,8 @@ class Bot:
         })
         snap = self.engine.snapshot()
         self.store.set("snapshot", snap)
+        if self.sheets.rows != self.store.get("sheet_rows", {}):     # remember which row is which trade
+            self.store.set("sheet_rows", dict(self.sheets.rows))
         if self.session_state == "open":   # remember how far today has been processed (restart resumes here)
             self.store.set("engine_state", self.engine.save_state())
         if time.time() - self.last_equity >= 60 and self.session_state == "open":
