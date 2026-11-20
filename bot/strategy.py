@@ -76,6 +76,7 @@ class Position:
     params: dict
     opened: str               # ISO timestamp
     gap_trade: bool = False
+    realized: float = 0.0     # P/L booked on this trade so far
 
 
 @dataclass
@@ -89,6 +90,8 @@ class Event:
     pnl: float = 0.0
     charges: float = 0.0
     note: str = ""
+    trade: str = ""           # id of the trade this event belongs to (its entry time)
+    total: float = 0.0        # the trade's realized P/L so far (incl. rollovers)
 
 
 def _round(x):
@@ -212,6 +215,8 @@ class Engine:
         self.last_price: dict[str, float] = {}
         self.last_tick: str | None = None
         self._prev: float | None = None
+        self.open_time: dt.time | None = None    # 09:00 normally, 17:00 on a 2nd-session-only day
+        self.placed: set = set()                 # contracts whose 09:10 / 17:10 orders are placed
 
     # ------------------------------------------------------------------ morning
     def prepare_day(self, day: dt.date, expiries: dict, bars: dict) -> list[Event]:
@@ -223,6 +228,7 @@ class Engine:
         self.gap_entry, self.gap_stop = {1: None, -1: None}, None
         self.entries_today = {1: 0, -1: 0}
         self.last_tick = None
+        self.open_time, self.placed = None, set()
         self.active = pick_contract(day, expiries, self.roll_days, self.holidays)
         self.levels = {c: lv for c in bars if (lv := compute_levels(c, bars[c]))}
         if not self.active or self.active not in self.levels:
@@ -264,6 +270,15 @@ class Engine:
             self.pos.sl = max(old, new) if self.pos.side == 1 else min(old, new)
 
     # ------------------------------------------------------------------ ticks
+    # Session timing, from the course Excel ("Order Placing Time"):
+    #   open O (09:00, or 17:00 when only the 2nd session trades):  target of a holding is live
+    #   O + 10 min (09:10 / 17:10):  buy entry, sell entry and stop-loss of a holding are placed
+    #   O + 15 min:  first 15-minute candle complete; gap orders are placed at O + 16 min
+    # A level already crossed when its order would be placed is handled with the gap rule.
+    PLACE_AFTER = dt.timedelta(minutes=10)
+    GAP_CANDLE = dt.timedelta(minutes=15)
+    GAP_ORDERS_AFTER = dt.timedelta(minutes=16)
+
     def on_tick(self, ts: dt.datetime, contract: str, price: float) -> list[Event]:
         ev: list[Event] = []
         if self.day is None or ts.date() != self.day or ts.time() < self.session_open:
@@ -272,17 +287,31 @@ class Engine:
         self.last_price[contract] = price
         self.last_tick = ts.isoformat(timespec="seconds")
         iso = self.last_tick
-        in_first15 = ts.time() < dt.time(9, 15)
 
-        # day open + first 15-minute candle tracking
+        # which session is trading today? (no morning prices before 17:00 = holiday morning)
+        if self.open_time is None:
+            self.open_time = dt.time(9, 0) if ts.time() < dt.time(17, 0) else dt.time(17, 0)
+            ev.append(Event(iso, "INFO", contract, note=f"Session opened at {self.open_time:%H:%M}"))
+        O = dt.datetime.combine(self.day, self.open_time)
+        if ts < O:
+            return ev
+        placed_time = ts >= O + self.PLACE_AFTER
+        gap_orders_time = ts >= O + self.GAP_ORDERS_AFTER
+
+        # day open and the first 15-minute candle
         if contract not in self.day_open:
             self.day_open[contract] = price
             ev += self._on_open(iso, contract, price)
-        if in_first15:
+        if ts < O + self.GAP_CANDLE:
             h = self.first15.setdefault(contract, [price, price])
             h[0], h[1] = max(h[0], price), min(h[1], price)
         else:
             ev += self._resolve_gaps(iso, contract)
+
+        # O + 10 min: orders get placed; a level already crossed by now follows the gap rule
+        if placed_time and contract not in self.placed:
+            self.placed.add(contract)
+            ev += self._on_place(iso, contract, price)
 
         # rollover
         if self.pos and self.roll_pending and ts.time() >= self.roll_time and contract == self.active:
@@ -290,33 +319,57 @@ class Engine:
             if old_px:
                 ev += self._rollover(iso, old_px, price)
 
-        # manage open position
+        # manage the holding (target live from the open, stop-loss from O + 10 min)
         if self.pos and contract == self.pos.contract:
-            ev += self._manage(iso, price, in_first15)
+            ev += self._manage(iso, price, stop_live=placed_time)
 
-        # new entries
-        if not self.pos and contract == self.active and self.active in self.levels:
-            ev += self._try_entry(iso, price)
+        # entries: both sides are live; the opposite side can trigger while holding (flip)
+        if contract == self.active and self.active in self.levels and placed_time:
+            ev += self._try_entry(iso, price, gap_orders_time)
         return ev
+
+    def _beyond(self, side, price, level):
+        return price >= level if side == 1 else price <= level
 
     def _on_open(self, iso, contract, open_px):
         ev = []
-        if contract == self.active and self.active in self.levels and not self.pos:
+        if contract == self.active and self.active in self.levels:
             lv = self.levels[contract]
-            if open_px > lv.buy_entry:
-                self.gap_entry[1] = "wait"
-                ev.append(Event(iso, "GAP", contract, 1, price=open_px,
-                                note=f"Gap up open {open_px:.0f} > buy entry {lv.buy_entry:.0f}: waiting for 09:15 candle"))
-            if open_px < lv.sell_entry:
-                self.gap_entry[-1] = "wait"
-                ev.append(Event(iso, "GAP", contract, -1, price=open_px,
-                                note=f"Gap down open {open_px:.0f} < sell entry {lv.sell_entry:.0f}: waiting for 09:15 candle"))
+            for side, lvl, word in ((1, lv.buy_entry, "up"), (-1, lv.sell_entry, "down")):
+                if self.pos and self.pos.side == side:
+                    continue
+                if self._beyond(side, open_px, lvl) and open_px != lvl:
+                    self.gap_entry[side] = "wait"
+                    ev.append(Event(iso, "GAP", contract, side, price=open_px,
+                                    note=f"Gap {word}: open {open_px:.0f} beyond {'buy' if side == 1 else 'sell'} "
+                                         f"entry {lvl:.0f}, waiting for the 15-minute candle"))
         if self.pos and contract == self.pos.contract and self.pos.sl is not None:
-            s, sl = self.pos.side, self.pos.sl
-            if (s == 1 and open_px < sl) or (s == -1 and open_px > sl):
+            if self._beyond(-self.pos.side, open_px, self.pos.sl):
                 self.gap_stop = "wait"
-                ev.append(Event(iso, "GAP", contract, s, price=open_px,
-                                note=f"Opened beyond stop {sl:.0f}: stop moves to 09:15 candle"))
+                ev.append(Event(iso, "GAP", contract, self.pos.side, price=open_px, trade=self.pos.opened,
+                                note=f"Opened beyond stop-loss {self.pos.sl:.0f}: stop moves to the 15-minute candle"))
+        return ev
+
+    def _on_place(self, iso, contract, price):
+        """Order placing time (09:10 / 17:10). Excel rule: a level the market already crossed since the
+        open is treated like a gap (wait for the 15-minute candle)."""
+        ev = []
+        if contract == self.active and self.active in self.levels:
+            lv = self.levels[contract]
+            for side, lvl in ((1, lv.buy_entry), (-1, lv.sell_entry)):
+                if self.gap_entry[side] is None and not (self.pos and self.pos.side == side) \
+                        and self._beyond(side, price, lvl):
+                    self.gap_entry[side] = "wait"
+                    ev.append(Event(iso, "GAP", contract, side, price=price,
+                                    note=f"Price {price:.0f} already beyond {'buy' if side == 1 else 'sell'} entry "
+                                         f"{lvl:.0f} at order time: gap rule, waiting for the 15-minute candle"))
+        p = self.pos
+        if p and contract == p.contract and p.sl is not None and self.gap_stop is None \
+                and self._beyond(-p.side, price, p.sl):
+            self.gap_stop = "wait"
+            ev.append(Event(iso, "GAP", contract, p.side, price=price, trade=p.opened,
+                            note=f"Price {price:.0f} already beyond stop-loss {p.sl:.0f} at order time: "
+                                 f"stop moves to the 15-minute candle"))
         return ev
 
     def _resolve_gaps(self, iso, contract):
@@ -331,54 +384,60 @@ class Engine:
                     px = hi * (1 + GAP["B"]) if side == 1 else lo * (1 - GAP["B"])
                     self.gap_entry[side] = px
                     ev.append(Event(iso, "GAP", contract, side, price=_round(px),
-                                    note=f"09:15 candle H {hi:.0f} L {lo:.0f}: gap {'buy' if side==1 else 'sell'} entry {px:.0f}"))
+                                    note=f"15-minute candle H {hi:.0f} L {lo:.0f}: gap "
+                                         f"{'buy' if side == 1 else 'sell'} entry {px:.0f}"))
         if self.gap_stop == "wait" and self.pos and contract == self.pos.contract:
             self.pos.sl = lo * (1 - NORMAL["B"]) if self.pos.side == 1 else hi * (1 + NORMAL["B"])
             self.gap_stop = None
-            ev.append(Event(iso, "GAP", contract, self.pos.side, price=_round(self.pos.sl),
-                            note=f"Gap stop set from 09:15 candle: {self.pos.sl:.0f}"))
+            ev.append(Event(iso, "GAP", contract, self.pos.side, price=_round(self.pos.sl), trade=self.pos.opened,
+                            note=f"Stop-loss set from the 15-minute candle: {self.pos.sl:.0f}"))
         return ev
 
     def _fill(self, level, price, crossed_up: bool):
-        """A resting stop/limit order fills at its level when price moves through it between ticks;
-        it fills at the market price only if price was already beyond the level (a jump/gap)."""
+        """A resting trigger order fills at its level when price moves through it between ticks;
+        it fills at the market price only if price was already beyond the level (a jump)."""
         prev = self._prev
         if prev is None:
             return price
         was_beyond = prev >= level if crossed_up else prev <= level
         return price if was_beyond else level
 
-    def _manage(self, iso, price, in_first15):
+    def _manage(self, iso, price, stop_live):
         ev, p = [], self.pos
-        if p.sl is not None and not (self.gap_stop == "wait"):
-            hit = price <= p.sl if p.side == 1 else price >= p.sl
-            if hit:
-                fill = self._fill(p.sl, price, crossed_up=(p.side == -1))
-                ev.append(self._close(iso, fill, p.lots, "STOP", f"Stop-loss {p.sl:.0f} hit"))
-                self.pos = None
-                return ev
-        if p.lots == 2 and ((p.side == 1 and price >= p.target) or (p.side == -1 and price <= p.target)):
+        if stop_live and p.sl is not None and self.gap_stop != "wait" and self._beyond(-p.side, price, p.sl):
+            fill = self._fill(p.sl, price, crossed_up=(p.side == -1))
+            ev.append(self._close(iso, fill, p.lots, "STOP", f"Stop-loss {p.sl:.0f} hit"))
+            self.pos = None
+            return ev
+        if p.lots == 2 and self._beyond(p.side, price, p.target):
             fill = self._fill(p.target, price, crossed_up=(p.side == 1))
             ev.append(self._close(iso, fill, 1, "TARGET", f"Target {p.target:.0f} hit: 1 lot booked"))
             p.lots = 1
             lv = self.levels.get(p.contract)
             if lv:
                 p.sl = self._stops(lv)[1]
-                ev.append(Event(iso, "INFO", p.contract, p.side, 1, note=f"Stop-loss 2 now {p.sl:.0f}"))
+                ev.append(Event(iso, "INFO", p.contract, p.side, 1, trade=p.opened,
+                                note=f"Stop-loss 2 now {p.sl:.0f}"))
         return ev
 
-    def _try_entry(self, iso, price):
+    def _try_entry(self, iso, price, gap_orders_time):
         lv = self.levels[self.active]
         for side in (1, -1):
-            if self.entries_today[side]:
+            if self.entries_today[side] or (self.pos and self.pos.side == side):
                 continue
             g = self.gap_entry[side]
-            if g == "wait":
+            if g == "wait" or (g is not None and not gap_orders_time):
                 continue
             gap = g is not None
             trig = g if gap else (lv.buy_entry if side == 1 else lv.sell_entry)
-            if (side == 1 and price >= trig) or (side == -1 and price <= trig):
-                return self._open(iso, side, self._fill(trig, price, crossed_up=(side == 1)), lv, gap)
+            if self._beyond(side, price, trig):
+                fill = self._fill(trig, price, crossed_up=(side == 1))
+                ev = []
+                if self.pos:   # opposite entry triggered while still holding: exit, then flip
+                    ev.append(self._close(iso, fill, self.pos.lots, "STOP",
+                                          f"Exit on opposite {'buy' if side == 1 else 'sell'} entry {trig:.0f}"))
+                    self.pos = None
+                return ev + self._open(iso, side, fill, lv, gap)
         return []
 
     def _open(self, iso, side, price, lv, gap):
@@ -394,7 +453,7 @@ class Engine:
         self.pos = Position(side, self.active, price, price, self.lots, price * (1 + params["T"] * side),
                             None, params, iso, gap)
         self._trail_stop(lv)
-        return [Event(iso, "ENTRY", self.active, side, self.lots, price, 0.0, chg,
+        return [Event(iso, "ENTRY", self.active, side, self.lots, price, 0.0, chg, trade=iso,
                       note=f"{'BUY' if side==1 else 'SELL'} {self.lots} lots{' (gap rule)' if gap else ''} | "
                            f"target {self.pos.target:.0f} | SL {self.pos.sl:.0f}")]
 
@@ -405,7 +464,9 @@ class Engine:
         self.wallet.realized += pnl
         self.wallet.charges += chg
         self.wallet.release(lots)
-        return Event(iso, kind, p.contract, p.side, lots, price, round(pnl, 2), round(chg, 2), note)
+        p.realized += pnl
+        return Event(iso, kind, p.contract, p.side, lots, price, round(pnl, 2), round(chg, 2), note, p.opened,
+                     round(p.realized, 2))
 
     def _rollover(self, iso, old_px, new_px):
         p = self.pos
@@ -417,7 +478,7 @@ class Engine:
         p.contract, p.entry = self.active, new_px
         self.roll_pending = False
         ev.append(Event(iso, "ROLL_IN", p.contract, p.side, p.lots, new_px, 0.0, round(chg, 2),
-                        f"Rollover: re-enter {p.contract}, target {p.target:.0f} SL {p.sl:.0f} unchanged"))
+                        f"Rollover: re-enter {p.contract}, target {p.target:.0f} SL {p.sl:.0f} unchanged", p.opened))
         return ev
 
     # ------------------------------------------------------------------ status
@@ -439,6 +500,8 @@ class Engine:
             gap_entry={str(k): v for k, v in self.gap_entry.items()},
             gap_stop=self.gap_stop,
             roll_pending=self.roll_pending,
+            session=self.open_time.strftime("%H:%M") if self.open_time else None,
+            orders_placed=self.active in self.placed if self.active else False,
             position=None if not self.pos else {**asdict(self.pos),
                                                 "target": _round(self.pos.target), "sl": _round(self.pos.sl)},
             last_price=self.last_price,
@@ -458,7 +521,9 @@ class Engine:
                                   gap_entry={str(k): v for k, v in self.gap_entry.items()},
                                   gap_stop=self.gap_stop,
                                   entries_today={str(k): v for k, v in self.entries_today.items()},
-                                  last_price=self.last_price))
+                                  last_price=self.last_price,
+                                  open_time=self.open_time.isoformat() if self.open_time else None,
+                                  placed=sorted(self.placed)))
 
     def restore_intraday(self, d: dict | None) -> str | None:
         """After prepare_day(): if the saved state is from today, put back today's open, 09:15 candle,
@@ -472,6 +537,8 @@ class Engine:
         self.entries_today = {int(k): v for k, v in d.get("entries_today", {}).items()} or {1: 0, -1: 0}
         self.last_price.update(d.get("last_price", {}))
         self.last_tick = d.get("last_tick")
+        self.open_time = dt.time.fromisoformat(d["open_time"]) if d.get("open_time") else None
+        self.placed = set(d.get("placed", []))
         return self.last_tick
 
     def load_state(self, d: dict):

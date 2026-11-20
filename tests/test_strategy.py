@@ -54,7 +54,7 @@ def test_levels_and_contract_choice():
 def test_long_entry_target_then_stop2():
     e = engine()
     e.prepare_day(DAY, EXP, {NOV: HIST})
-    ev = ticks(e, NOV, [((9, 0), 129000), ((10, 0), 130200)])       # crosses 130156
+    ev = ticks(e, NOV, [((9, 0), 129000), ((9, 10), 129000), ((10, 0), 130200)])       # crosses 130156
     assert kinds(ev) == ["ENTRY"] and e.pos.side == 1 and e.pos.lots == 2
     E = 130000 * 1.0012                                           # fills at the trigger, not the tick
     assert e.pos.entry == pytest.approx(E)
@@ -74,7 +74,7 @@ def test_long_entry_target_then_stop2():
 def test_short_entry_stop_both_lots():
     e = engine()
     e.prepare_day(DAY, EXP, {NOV: HIST})
-    ev = ticks(e, NOV, [((9, 0), 127000), ((11, 0), 125800), ((13, 0), 127800)])
+    ev = ticks(e, NOV, [((9, 0), 127000), ((9, 10), 127000), ((11, 0), 125800), ((13, 0), 127800)])
     assert kinds(ev) == ["ENTRY", "STOP"]
     E = 126000 * 0.9988                                   # sell trigger 125,848.8
     SL = min(E * 1.015, 129000 * 1.0012)                  # SL1 = 127,736.5
@@ -101,7 +101,7 @@ def test_gap_up_waits_for_first_15_minutes():
 def test_gap_beyond_stop_uses_0915_candle():
     e = engine()
     e.prepare_day(DAY, EXP, {NOV: HIST})
-    ticks(e, NOV, [((9, 0), 129000), ((10, 0), 130200)])            # long, SL1 ~128247
+    ticks(e, NOV, [((9, 0), 129000), ((9, 10), 129000), ((10, 0), 130200)])            # long, SL1 ~128247
     nxt = dt.date(2026, 11, 16)
     e.prepare_day(nxt, EXP, {NOV: HIST})
     ev = [*e.on_tick(t(9, 0, day=nxt), NOV, 127800)]               # opens below the stop
@@ -116,7 +116,7 @@ def test_gap_beyond_stop_uses_0915_candle():
 def test_rollover_keeps_same_target_and_stop_numbers():
     e = engine()
     e.prepare_day(DAY, EXP, {NOV: HIST})
-    ticks(e, NOV, [((9, 0), 129000), ((10, 0), 130200)])
+    ticks(e, NOV, [((9, 0), 129000), ((9, 10), 129000), ((10, 0), 130200)])
     target, sl = e.pos.target, e.pos.sl
     roll_day = dt.date(2026, 11, 17)                               # NOV now has < 10 days left
     dec_hist = bars([(h * 1.006, l * 1.006) for h, l in [(130000, 126000), (129500, 126500),
@@ -133,14 +133,14 @@ def test_rollover_keeps_same_target_and_stop_numbers():
 def test_insufficient_funds_skips_entry():
     e = engine(cash=30000)                                          # 2 lots need ~32,550
     e.prepare_day(DAY, EXP, {NOV: HIST})
-    ev = ticks(e, NOV, [((9, 0), 129000), ((10, 0), 130200)])
+    ev = ticks(e, NOV, [((9, 0), 129000), ((9, 10), 129000), ((10, 0), 130200)])
     assert kinds(ev) == ["SKIP"] and e.pos is None
 
 
 def test_stop_only_moves_in_favour():
     e = engine()
     e.prepare_day(DAY, EXP, {NOV: HIST})
-    ticks(e, NOV, [((9, 0), 129000), ((10, 0), 130200)])
+    ticks(e, NOV, [((9, 0), 129000), ((9, 10), 129000), ((10, 0), 130200)])
     sl = e.pos.sl
     lower = bars([(129000, 120000)] * 4)                            # 2DLL collapses
     e.prepare_day(dt.date(2026, 11, 16), EXP, {NOV: lower})
@@ -173,7 +173,7 @@ def test_todays_case_gap_down_late_start_no_trade_above_0915_low():
 def test_restart_same_day_restores_state_without_duplicate_trade():
     e = engine()
     e.prepare_day(DAY, EXP, {NOV: HIST})
-    ticks(e, NOV, [((9, 0), 129000), ((10, 0), 130200)])          # bought once
+    ticks(e, NOV, [((9, 0), 129000), ((9, 10), 129000), ((10, 0), 130200)])          # bought once
     saved = e.save_state()
     e2 = engine()
     e2.load_state(saved)
@@ -181,3 +181,57 @@ def test_restart_same_day_restores_state_without_duplicate_trade():
     assert e2.restore_intraday(saved["intraday"]) == "2026-11-13T10:00:00"
     assert e2.entries_today[1] == 1 and e2.day_open[NOV] == 129000
     assert e2.pos and e2.pos.side == 1
+
+
+# ---------------- Excel timing, flip and 2nd-session rules ----------------
+
+def test_no_entry_before_0910_order_time():
+    e = engine()
+    e.prepare_day(DAY, EXP, {NOV: HIST})
+    ev = ticks(e, NOV, [((9, 0), 129000), ((9, 5), 130300), ((9, 10), 129900)])
+    assert "ENTRY" not in kinds(ev)                       # 09:05 cross ignored: orders not placed yet
+    ev = ticks(e, NOV, [((9, 40), 129950), ((10, 0), 130200)])
+    assert kinds(ev) == ["ENTRY"] and e.pos.entry == pytest.approx(130000 * 1.0012)
+
+
+def test_crossed_before_0910_follows_gap_rule():
+    e = engine()
+    e.prepare_day(DAY, EXP, {NOV: HIST})
+    ev = ticks(e, NOV, [((9, 0), 129800), ((9, 6), 130500), ((9, 10), 130300)])
+    assert kinds(ev) == ["GAP"] and e.gap_entry[1] == "wait"   # already beyond 130,156 at 09:10
+    ev = ticks(e, NOV, [((9, 16), 130400)])
+    assert e.gap_entry[1] == pytest.approx(130500 * 1.00125)   # 15-minute high + 0.125%
+    ev = ticks(e, NOV, [((9, 30), 130700)])
+    assert kinds(ev) == ["ENTRY"] and e.pos.gap_trade
+
+
+def test_stop_loss_not_live_before_0910():
+    e = engine()
+    e.prepare_day(DAY, EXP, {NOV: HIST})
+    ticks(e, NOV, [((9, 0), 129000), ((9, 10), 129000), ((10, 0), 130200)])    # long, SL1 ~128,247
+    nxt = dt.date(2026, 11, 16)
+    e.prepare_day(nxt, EXP, {NOV: HIST})
+    ev = ticks(e, NOV, [((9, 0), 129000), ((9, 4), 128100), ((9, 10), 128900)]).__iter__()
+    assert e.pos is not None                                   # 09:04 dip below SL ignored
+
+
+def test_flip_stop2_and_sell_entry_trigger_together():
+    hist = bars([(130000, 128500), (129800, 128600), (129500, 128700), (129600, 128800)])
+    e = engine()
+    e.prepare_day(DAY, EXP, {NOV: hist})
+    ticks(e, NOV, [((9, 0), 129000), ((9, 10), 129000), ((10, 0), 130200)])    # buy @130,156
+    ticks(e, NOV, [((11, 0), 132200)])                                          # target, SL2 = sell entry
+    sell = 128500 * 0.9988
+    assert e.pos.lots == 1 and e.pos.sl == pytest.approx(sell)
+    ev = ticks(e, NOV, [((13, 0), 128000)])
+    assert kinds(ev) == ["STOP", "ENTRY"]                     # long out, short in (Excel 19/11 example)
+    assert e.pos.side == -1 and e.pos.entry == pytest.approx(sell) and e.pos.lots == 2
+
+
+def test_second_session_only_day_uses_1700_timing():
+    e = engine()
+    e.prepare_day(DAY, EXP, {NOV: HIST})
+    ev = ticks(e, NOV, [((17, 0), 129000), ((17, 5), 130300)])
+    assert e.open_time == dt.time(17, 0) and "ENTRY" not in kinds(ev)
+    ev = ticks(e, NOV, [((17, 10), 129900), ((18, 0), 130200)])
+    assert kinds(ev) == ["ENTRY"]

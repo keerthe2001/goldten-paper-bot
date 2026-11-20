@@ -56,7 +56,7 @@ class Bot:
     def __init__(self, sim: bool, speed: float):
         self.store = Store(ROOT / env("DB_PATH", "data/goldten.db"))
         self.tg = Telegram(env("TELEGRAM_TOKEN"), env("TELEGRAM_CHAT_ID"))
-        self.sheets = Sheets(env("GOOGLE_CREDS_FILE"), env("GOOGLE_SHEET_ID"), env("GOOGLE_SHEET_TAB", "Paper Trades"))
+        self.sheets = Sheets(env("GOOGLE_CREDS_FILE"), env("GOOGLE_SHEET_ID"), env("GOOGLE_SHEET_TAB", "Gold Ten Trades"))
         self.holidays = frozenset(dt.date.fromisoformat(d.strip())
                                   for d in (env("MCX_HOLIDAYS", "") or "").split(",") if d.strip())
         if sim:
@@ -89,8 +89,8 @@ class Bot:
             self.store.add_event(e)
             msg = f"{e.kind:<8} {e.contract} {SIDE[e.side]} {e.lots or ''} @ {e.price or ''} | {e.note}"
             log.info(msg)
+            self.sheets.trade_event(e, snap.get("position"), snap.get("levels"))
             if e.kind in ALERT_KINDS:
-                self.sheets.add(e, snap["wallet"]["available"], snap["wallet"]["equity"])
                 pnl = f"\nP/L: ₹{e.pnl:,.0f}" if e.pnl else ""
                 self.tg.send(f"Gold Ten paper bot\n{e.kind} {SIDE[e.side]} {e.contract}\n"
                              f"Price: {e.price:,.0f}{pnl}\n{e.note}")
@@ -111,6 +111,8 @@ class Bot:
         needed.discard(None)
         bars = {s: self.feed.daily_bars(contracts[s]["token"], day) for s in needed}
         self.handle(self.engine.prepare_day(day, expiries, bars))
+        if self.engine.pos:     # daily stop-loss trail -> tracking sheet
+            self.sheets.update_sl(self.engine.pos.opened, round(self.engine.pos.sl or 0, 2))
 
         # Started late or restarted mid-session? Pick up where we left off, then replay what we missed
         # (1-minute candles) through the same rules, so gaps, entries and stops match a bot that ran all day.
