@@ -47,7 +47,7 @@ td.note { white-space: normal; min-width: 220px; color: var(--muted); }
 .r { text-align: right; }
 .row { display: flex; justify-content: space-between; align-items: center; }
 .toggle { font-size: 13px; color: var(--muted); }
-#sheet { width: 100%; height: 520px; border: 1px solid var(--line); border-radius: 8px; background: #fff; }
+#sheet { display: block; width: 100%; height: 80vh; min-height: 520px; border: 1px solid var(--line); border-radius: 8px; background: #fff; }
 #sheetLink { font-size: 13px; color: var(--gold); }
 .log { margin: 0; height: 280px; overflow: auto; font: 12px/1.5 var(--mono); background: var(--bg);
   border: 1px solid var(--line); border-radius: 8px; padding: 10px; white-space: pre-wrap; word-break: break-word; }
